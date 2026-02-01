@@ -21,23 +21,53 @@ import { bufferCount, from, lastValueFrom, mergeMap, tap } from "rxjs"
 import * as yauzl from "yauzl-promise"
 import packageJson from "../package.json"
 
-const TIGER_ADDRFEAT_URL =
-  "https://www2.census.gov/geo/tiger/TIGER2024/ADDRFEAT"
-const GAZETTEER_URL =
-  "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_zcta_national.zip"
+/** Builds TIGER ADDRFEAT URL for a given year. */
+function getTigerUrl(year: number) {
+  return `https://www2.census.gov/geo/tiger/TIGER${year}/ADDRFEAT`
+}
+
+/** Builds Gazetteer URL for a given year. */
+function getGazetteerUrl(year: number) {
+  return `https://www2.census.gov/geo/docs/maps-data/data/gazetteer/${year}_Gazetteer/${year}_Gaz_zcta_national.zip`
+}
+
+/**
+ * Auto-resolves the latest available TIGER year by checking URLs starting from
+ * the current year and working backwards.
+ */
+async function resolveYear(): Promise<number> {
+  const currentYear = new Date().getFullYear()
+
+  for (let year = currentYear; year >= 2020; year--) {
+    const url = getTigerUrl(year)
+    try {
+      const response = await fetch(url, { method: "HEAD" })
+      if (response.ok) {
+        console.log(`Resolved TIGER year: ${year}`)
+        return year
+      }
+    } catch {
+      // Try next year
+    }
+  }
+
+  throw new Error("Could not find any valid TIGER dataset (checked 2020-now)")
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // URL List Command
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function generateUrls(output: string) {
-  console.log("Fetching ADDRFEAT file list from Census Bureau...")
+async function generateUrls(output: string, year: number) {
+  const tigerUrl = getTigerUrl(year)
+  console.log(`Fetching ADDRFEAT file list from Census Bureau (${year})...`)
 
-  const response = await fetch(TIGER_ADDRFEAT_URL)
+  const response = await fetch(tigerUrl)
   const html = await response.text()
-  const matches = html.match(/tl_2024_\d+_addrfeat\.zip/g) ?? []
+  const pattern = new RegExp(`tl_${year}_\\d+_addrfeat\\.zip`, "g")
+  const matches = html.match(pattern) ?? []
   const unique = [...new Set(matches)]
-  const urls = unique.map((f) => `${TIGER_ADDRFEAT_URL}/${f}`)
+  const urls = unique.map((f) => `${tigerUrl}/${f}`)
 
   console.log(`Found ${urls.length} ADDRFEAT files`)
 
@@ -163,10 +193,11 @@ async function downloadFiles(
 // Gazetteer Command
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function downloadGazetteer(outputPath: string) {
-  console.log("Downloading ZCTA gazetteer...")
+async function downloadGazetteer(outputPath: string, year: number) {
+  const gazetteerUrl = getGazetteerUrl(year)
+  console.log(`Downloading ZCTA gazetteer (${year})...`)
 
-  const response = await fetch(GAZETTEER_URL)
+  const response = await fetch(gazetteerUrl)
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
   const zipBuffer = Buffer.from(await response.arrayBuffer())
@@ -232,7 +263,7 @@ async function processAddrfeatFile(
 ): Promise<ProcessedStreet[]> {
   const filename = path.basename(dbfPath)
 
-  const fipsMatch = filename.match(/tl_2024_(\d{2})(\d{3})_addrfeat\.dbf/)
+  const fipsMatch = filename.match(/tl_\d{4}_(\d{2})(\d{3})_addrfeat\.dbf/)
   if (!fipsMatch?.[1] || !fipsMatch[2]) return []
 
   const stateFips = fipsMatch[1]
@@ -334,7 +365,7 @@ async function buildDatabase(
 
   // Find all extracted ADDRFEAT DBF files
   const dbfDir = path.join(inputDir, "dbf")
-  const glob = new Glob("tl_2024_*_addrfeat.dbf")
+  const glob = new Glob("tl_*_addrfeat.dbf")
   const files: string[] = []
   for await (const file of glob.scan(dbfDir)) {
     files.push(path.join(dbfDir, file))
@@ -507,8 +538,15 @@ program
   .command("urls")
   .description("Generate list of TIGER ADDRFEAT URLs")
   .option("-o, --output <file>", "Output file (use - for stdout)", "urls.txt")
+  .option(
+    "-y, --year <year>",
+    "TIGER dataset year (or 'auto' to resolve)",
+    "auto",
+  )
   .action(async (opts) => {
-    await generateUrls(opts.output)
+    const year =
+      opts.year === "auto" ? await resolveYear() : parseInt(opts.year)
+    await generateUrls(opts.output, year)
   })
 
 program
@@ -525,8 +563,11 @@ program
   .command("gazetteer")
   .description("Download ZCTA gazetteer for ZIP centroids")
   .option("-o, --output <file>", "Output file", "./gazetteer.txt")
+  .option("-y, --year <year>", "Gazetteer year (or 'auto' to resolve)", "auto")
   .action(async (opts) => {
-    await downloadGazetteer(opts.output)
+    const year =
+      opts.year === "auto" ? await resolveYear() : parseInt(opts.year)
+    await downloadGazetteer(opts.output, year)
   })
 
 program
