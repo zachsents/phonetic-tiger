@@ -438,7 +438,7 @@ program
 program
   .command("download")
   .description("Download ADDRFEAT files from URL list")
-  .requiredOption("-i, --input <file>", "URL list file")
+  .option("-i, --input <file>", "URL list file", "./urls.txt")
   .option("-o, --output <dir>", "Output directory", "./addrfeat")
   .option("-c, --concurrency <n>", "Download concurrency", "10")
   .action(async (opts) => {
@@ -456,8 +456,12 @@ program
 program
   .command("build")
   .description("Build SQLite database from downloaded files")
-  .requiredOption("-i, --input <dir>", "Directory containing ADDRFEAT zips")
-  .requiredOption("-g, --gazetteer <file>", "Gazetteer file path")
+  .option(
+    "-i, --input <dir>",
+    "Directory containing ADDRFEAT zips",
+    "./addrfeat",
+  )
+  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
   .option("-o, --output <file>", "Output database path", "./addresses.db")
   .option("-c, --concurrency <n>", "Processing concurrency", "5")
   .action(async (opts) => {
