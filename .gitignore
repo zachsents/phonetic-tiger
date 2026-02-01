@@ -1,0 +1,9 @@
+node_modules/
+*.db
+*.db-*
+build-temp/
+addrfeat/
+gazetteer.txt
+urls.txt
+dist
+.DS_Store
