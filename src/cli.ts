@@ -14,6 +14,8 @@ import { Glob } from "bun"
 import { program } from "commander"
 import { DBFFile } from "dbffile"
 import { doubleMetaphone } from "double-metaphone"
+// @ts-expect-error -- no types available for parse-address
+import { parseLocation } from "parse-address"
 import pLimit from "p-limit"
 import { bufferCount, from, lastValueFrom, mergeMap, tap } from "rxjs"
 import * as yauzl from "yauzl-promise"
@@ -21,8 +23,6 @@ import packageJson from "../package.json"
 
 const TIGER_ADDRFEAT_URL =
   "https://www2.census.gov/geo/tiger/TIGER2024/ADDRFEAT"
-const TIGER_FEATNAMES_URL =
-  "https://www2.census.gov/geo/tiger/TIGER2024/FEATNAMES"
 const GAZETTEER_URL =
   "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_zcta_national.zip"
 
@@ -31,35 +31,20 @@ const GAZETTEER_URL =
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function generateUrls(output: string) {
-  console.log("Fetching file lists from Census Bureau...")
+  console.log("Fetching ADDRFEAT file list from Census Bureau...")
 
-  // Fetch ADDRFEAT URLs
-  const addrfeatResponse = await fetch(TIGER_ADDRFEAT_URL)
-  const addrfeatHtml = await addrfeatResponse.text()
-  const addrfeatMatches = addrfeatHtml.match(/tl_2024_\d+_addrfeat\.zip/g) ?? []
-  const addrfeatUnique = [...new Set(addrfeatMatches)]
-  const addrfeatUrls = addrfeatUnique.map((f) => `${TIGER_ADDRFEAT_URL}/${f}`)
+  const response = await fetch(TIGER_ADDRFEAT_URL)
+  const html = await response.text()
+  const matches = html.match(/tl_2024_\d+_addrfeat\.zip/g) ?? []
+  const unique = [...new Set(matches)]
+  const urls = unique.map((f) => `${TIGER_ADDRFEAT_URL}/${f}`)
 
-  // Fetch FEATNAMES URLs
-  const featnamesResponse = await fetch(TIGER_FEATNAMES_URL)
-  const featnamesHtml = await featnamesResponse.text()
-  const featnamesMatches =
-    featnamesHtml.match(/tl_2024_\d+_featnames\.zip/g) ?? []
-  const featnamesUnique = [...new Set(featnamesMatches)]
-  const featnamesUrls = featnamesUnique.map(
-    (f) => `${TIGER_FEATNAMES_URL}/${f}`,
-  )
-
-  const allUrls = [...addrfeatUrls, ...featnamesUrls]
-
-  console.log(
-    `Found ${addrfeatUrls.length} ADDRFEAT + ${featnamesUrls.length} FEATNAMES files`,
-  )
+  console.log(`Found ${urls.length} ADDRFEAT files`)
 
   if (output === "-") {
-    for (const url of allUrls) console.log(url)
+    for (const url of urls) console.log(url)
   } else {
-    await Bun.write(output, allUrls.join("\n") + "\n")
+    await Bun.write(output, urls.join("\n") + "\n")
     console.log(`Written to ${output}`)
   }
 }
@@ -83,23 +68,17 @@ async function downloadFiles(
   await checkUnzipInstalled()
 
   const content = await Bun.file(urlFile).text()
-  const allUrls = content.trim().split("\n").filter(Boolean)
+  const urls = content.trim().split("\n").filter(Boolean)
 
-  // Separate ADDRFEAT and FEATNAMES URLs
-  const addrfeatUrls = allUrls.filter((u) => u.includes("addrfeat"))
-  const featnamesUrls = allUrls.filter((u) => u.includes("featnames"))
-
-  console.log(
-    `Downloading ${addrfeatUrls.length} ADDRFEAT + ${featnamesUrls.length} FEATNAMES files...`,
-  )
+  console.log(`Downloading ${urls.length} ADDRFEAT files...`)
   await fs.mkdir(outputDir, { recursive: true })
 
   const limit = pLimit(concurrency)
   let completed = 0
+  let skipped = 0
   let errors = 0
-  const total = allUrls.length
 
-  const tasks = allUrls.map((url) =>
+  const tasks = urls.map((url) =>
     limit(async () => {
       const filename = path.basename(url)
       const outputPath = path.join(outputDir, filename)
@@ -107,6 +86,7 @@ async function downloadFiles(
       // Skip if already exists
       try {
         await fs.access(outputPath)
+        skipped++
         completed++
         return
       } catch {
@@ -119,7 +99,7 @@ async function downloadFiles(
         const buffer = await response.arrayBuffer()
         await Bun.write(outputPath, buffer)
         completed++
-        const pct = ((completed / total) * 100).toFixed(1)
+        const pct = ((completed / urls.length) * 100).toFixed(1)
         process.stdout.write(`\r[${pct}%] Downloaded ${filename}`.padEnd(60))
       } catch (err) {
         errors++
@@ -129,47 +109,37 @@ async function downloadFiles(
   )
 
   await Promise.all(tasks)
-  console.log(`\nComplete. Downloaded: ${completed}, Errors: ${errors}`)
+  console.log(
+    `\nComplete. Downloaded: ${completed - skipped}, Skipped: ${skipped}, Errors: ${errors}`,
+  )
 
-  // Extract DBF files to separate directories (skip if DBF already exists)
+  // Extract DBF files (skip if DBF already exists)
   console.log("\nExtracting DBF files (skipping existing)...")
 
-  const addrfeatDir = path.join(outputDir, "addrfeat")
-  const featnamesDir = path.join(outputDir, "featnames")
-  await fs.mkdir(addrfeatDir, { recursive: true })
-  await fs.mkdir(featnamesDir, { recursive: true })
+  const dbfDir = path.join(outputDir, "dbf")
+  await fs.mkdir(dbfDir, { recursive: true })
 
-  // Helper to extract only zips whose DBFs don't exist
-  const extractMissing = async (
-    zipPattern: string,
-    dbfDir: string,
-    label: string,
-  ) => {
-    const zipGlob = new Glob(zipPattern)
-    const zipsToExtract: string[] = []
+  const zipGlob = new Glob("*_addrfeat.zip")
+  const zipsToExtract: string[] = []
 
-    for await (const zipFile of zipGlob.scan(outputDir)) {
-      // Convert zip filename to expected DBF filename
-      const dbfName = zipFile.replace(".zip", ".dbf")
-      const dbfPath = path.join(dbfDir, dbfName)
+  for await (const zipFile of zipGlob.scan(outputDir)) {
+    const dbfName = zipFile.replace(".zip", ".dbf")
+    const dbfPath = path.join(dbfDir, dbfName)
 
-      try {
-        await fs.access(dbfPath)
-        // DBF exists, skip
-      } catch {
-        // DBF doesn't exist, need to extract
-        zipsToExtract.push(path.join(outputDir, zipFile))
-      }
+    try {
+      await fs.access(dbfPath)
+      // DBF exists, skip
+    } catch {
+      // DBF doesn't exist, need to extract
+      zipsToExtract.push(path.join(outputDir, zipFile))
     }
+  }
 
-    if (zipsToExtract.length === 0) {
-      console.log(`  ${label}: all DBFs already extracted`)
-      return
-    }
+  if (zipsToExtract.length === 0) {
+    console.log("  All DBFs already extracted")
+  } else {
+    console.log(`  Extracting ${zipsToExtract.length} files...`)
 
-    console.log(`  ${label}: extracting ${zipsToExtract.length} files...`)
-
-    // Extract in parallel batches
     const extractLimit = pLimit(concurrency)
     await Promise.all(
       zipsToExtract.map((zipPath) =>
@@ -182,21 +152,11 @@ async function downloadFiles(
     )
   }
 
-  await extractMissing("*_addrfeat.zip", addrfeatDir, "ADDRFEAT")
-  await extractMissing("*_featnames.zip", featnamesDir, "FEATNAMES")
-
-  const addrfeatCount = await Bun.$`ls ${addrfeatDir}/*.dbf 2>/dev/null | wc -l`
+  const dbfCount = await Bun.$`ls ${dbfDir}/*.dbf 2>/dev/null | wc -l`
     .quiet()
     .text()
-  const featnamesCount =
-    await Bun.$`ls ${featnamesDir}/*.dbf 2>/dev/null | wc -l`.quiet().text()
 
-  console.log(
-    `Extracted ${addrfeatCount.trim()} ADDRFEAT DBFs to ${addrfeatDir}`,
-  )
-  console.log(
-    `Extracted ${featnamesCount.trim()} FEATNAMES DBFs to ${featnamesDir}`,
-  )
+  console.log(`Extracted ${dbfCount.trim()} DBFs to ${dbfDir}`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,14 +202,6 @@ interface ZipCentroid {
   lon: number
 }
 
-/** Structured street name from FEATNAMES. */
-interface StreetName {
-  prefix: string | null // PREDIRABRV - direction prefix (N, S, E, W)
-  name: string // NAME - the street name
-  type: string | null // SUFTYPABRV - street type (St, Ave, Rd)
-  suffix: string | null // SUFDIRABRV - direction suffix
-}
-
 /** Processed street ready for database insertion. */
 interface ProcessedStreet {
   stateFips: string
@@ -263,98 +215,20 @@ interface ProcessedStreet {
   zips: string[]
 }
 
-/** Creates a unique key for a street name variant. */
-function streetNameKey(s: StreetName): string {
-  return `${s.prefix ?? ""}|${s.name}|${s.type ?? ""}|${s.suffix ?? ""}`
+/** Result from parse-address for a street name. */
+interface ParsedStreet {
+  prefix?: string
+  street?: string
+  type?: string
+  suffix?: string
 }
 
 /**
- * Loads all FEATNAMES DBFs into a Map keyed by LINEARID, collecting all unique
- * name variants per LINEARID.
- */
-async function loadFeatnamesLookup(
-  featnamesDir: string,
-  concurrency: number,
-): Promise<Map<string, Set<string>>> {
-  const glob = new Glob("tl_2024_*_featnames.dbf")
-  const files: string[] = []
-  for await (const file of glob.scan(featnamesDir)) {
-    files.push(path.join(featnamesDir, file))
-  }
-
-  console.log(`Loading ${files.length} FEATNAMES files...`)
-
-  // Map: LINEARID -> Set of streetNameKey strings
-  const lookup = new Map<string, Set<string>>()
-  const limit = pLimit(concurrency)
-  let filesProcessed = 0
-
-  const tasks = files.map((file) =>
-    limit(async () => {
-      try {
-        const dbf = await DBFFile.open(file)
-        let batch: Array<Record<string, unknown>>
-
-        while ((batch = await dbf.readRecords(1000)).length > 0) {
-          for (const record of batch) {
-            const linearId = (record.LINEARID as string | undefined)?.trim()
-            const name = (record.NAME as string | undefined)?.trim()
-            if (!linearId || !name) continue
-
-            const streetName: StreetName = {
-              prefix: (record.PREDIRABRV as string | undefined)?.trim() || null,
-              name,
-              type: (record.SUFTYPABRV as string | undefined)?.trim() || null,
-              suffix: (record.SUFDIRABRV as string | undefined)?.trim() || null,
-            }
-
-            const key = streetNameKey(streetName)
-            const existing = lookup.get(linearId)
-            if (existing) {
-              existing.add(key)
-            } else {
-              lookup.set(linearId, new Set([key]))
-            }
-          }
-        }
-      } catch {
-        // Skip files that fail to open
-      }
-
-      filesProcessed++
-      const pct = ((filesProcessed / files.length) * 100).toFixed(1)
-      process.stdout.write(
-        `\r[${pct}%] Loaded ${filesProcessed}/${files.length} FEATNAMES files`.padEnd(
-          70,
-        ),
-      )
-    }),
-  )
-
-  await Promise.all(tasks)
-  console.log(`\nLoaded ${lookup.size} unique LINEARIDs`)
-
-  return lookup
-}
-
-/** Parses a streetNameKey back into a StreetName object. */
-function parseStreetNameKey(key: string): StreetName {
-  const [prefix, name, type, suffix] = key.split("|")
-  return {
-    prefix: prefix || null,
-    name: name ?? "",
-    type: type || null,
-    suffix: suffix || null,
-  }
-}
-
-/**
- * Processes a single ADDRFEAT DBF file, joining with FEATNAMES lookup to get
- * structured name fields.
+ * Processes a single ADDRFEAT DBF file, parsing FULLNAME with parse-address to
+ * get structured name fields.
  */
 async function processAddrfeatFile(
   dbfPath: string,
-  featnamesLookup: Map<string, Set<string>>,
 ): Promise<ProcessedStreet[]> {
   const filename = path.basename(dbfPath)
 
@@ -364,8 +238,11 @@ async function processAddrfeatFile(
   const stateFips = fipsMatch[1]
   const countyFips = fipsMatch[2]
 
-  // Map: streetNameKey -> { zips }
-  const streetMap = new Map<string, Set<string>>()
+  // Map: unique key -> { parsed, zips }
+  const streetMap = new Map<
+    string,
+    { parsed: ParsedStreet; fullname: string; zips: Set<string> }
+  >()
 
   try {
     const dbf = await DBFFile.open(dbfPath)
@@ -373,30 +250,27 @@ async function processAddrfeatFile(
 
     while ((batch = await dbf.readRecords(1000)).length > 0) {
       for (const record of batch) {
-        const linearId = (record.LINEARID as string | undefined)?.trim()
-        if (!linearId) continue
+        const fullname = (record.FULLNAME as string | undefined)?.trim()
+        if (!fullname) continue
 
         const zipL = (record.ZIPL as string | undefined)?.trim() || null
         const zipR = (record.ZIPR as string | undefined)?.trim() || null
         if (!zipL && !zipR) continue
 
-        // Look up structured names from FEATNAMES
-        const nameKeys = featnamesLookup.get(linearId)
-        if (!nameKeys || nameKeys.size === 0) continue
+        // Parse the fullname to get structured components
+        const parsed = (parseLocation(fullname) as ParsedStreet | null) ?? {}
 
-        // Add ZIPs for each name variant
-        for (const nameKey of nameKeys) {
-          const fullKey = `${stateFips}|${countyFips}|${nameKey}`
-          const existing = streetMap.get(fullKey)
-          if (existing) {
-            if (zipL) existing.add(zipL)
-            if (zipR) existing.add(zipR)
-          } else {
-            const zips = new Set<string>()
-            if (zipL) zips.add(zipL)
-            if (zipR) zips.add(zipR)
-            streetMap.set(fullKey, zips)
-          }
+        // Create unique key based on parsed components
+        const key = `${stateFips}|${countyFips}|${parsed.prefix ?? ""}|${parsed.street ?? fullname}|${parsed.type ?? ""}|${parsed.suffix ?? ""}`
+        const existing = streetMap.get(key)
+        if (existing) {
+          if (zipL) existing.zips.add(zipL)
+          if (zipR) existing.zips.add(zipR)
+        } else {
+          const zips = new Set<string>()
+          if (zipL) zips.add(zipL)
+          if (zipR) zips.add(zipR)
+          streetMap.set(key, { parsed, fullname, zips })
         }
       }
     }
@@ -406,22 +280,19 @@ async function processAddrfeatFile(
 
   // Convert to processed streets with metaphone on NAME only
   const results: ProcessedStreet[] = []
-  for (const [fullKey, zips] of streetMap) {
-    // Parse out the streetNameKey part (skip stateFips|countyFips|)
-    const nameKeyStart = fullKey.indexOf("|", fullKey.indexOf("|") + 1) + 1
-    const nameKey = fullKey.slice(nameKeyStart)
-    const streetName = parseStreetNameKey(nameKey)
+  for (const { parsed, fullname, zips } of streetMap.values()) {
+    const streetName = parsed.street ?? fullname
 
-    // Compute metaphone on just the name
-    const [primary, secondary] = doubleMetaphone(streetName.name)
+    // Compute metaphone on just the street name
+    const [primary, secondary] = doubleMetaphone(streetName)
 
     results.push({
       stateFips,
       countyFips,
-      prefix: streetName.prefix,
-      name: streetName.name,
-      type: streetName.type,
-      suffix: streetName.suffix,
+      prefix: parsed.prefix ?? null,
+      name: streetName,
+      type: parsed.type ?? null,
+      suffix: parsed.suffix ?? null,
       metaphonePrimary: primary,
       metaphoneSecondary: secondary ?? null,
       zips: [...zips],
@@ -461,19 +332,12 @@ async function buildDatabase(
 ) {
   const startTime = Date.now()
 
-  // Load FEATNAMES lookup first
-  const featnamesDir = path.join(inputDir, "featnames")
-  const featnamesLookup = await loadFeatnamesLookup(
-    featnamesDir,
-    readConcurrency,
-  )
-
   // Find all extracted ADDRFEAT DBF files
-  const addrfeatDir = path.join(inputDir, "addrfeat")
+  const dbfDir = path.join(inputDir, "dbf")
   const glob = new Glob("tl_2024_*_addrfeat.dbf")
   const files: string[] = []
-  for await (const file of glob.scan(addrfeatDir)) {
-    files.push(path.join(addrfeatDir, file))
+  for await (const file of glob.scan(dbfDir)) {
+    files.push(path.join(dbfDir, file))
   }
   console.log(`Found ${files.length} ADDRFEAT DBF files`)
 
@@ -576,12 +440,12 @@ async function buildDatabase(
     `Processing ADDRFEAT files (read concurrency: ${readConcurrency}, write batch: ${writeBatchSize})...`,
   )
 
-  // RxJS pipeline: read ADDRFEAT files, join with FEATNAMES, batch writes
+  // RxJS pipeline: read ADDRFEAT files, parse with parse-address, batch writes
   await lastValueFrom(
     from(files).pipe(
-      // Read and process ADDRFEAT files with concurrency, joining with FEATNAMES
+      // Read and process ADDRFEAT files with concurrency
       mergeMap(async (file) => {
-        const streets = await processAddrfeatFile(file, featnamesLookup)
+        const streets = await processAddrfeatFile(file)
         filesProcessed++
         const pct = ((filesProcessed / files.length) * 100).toFixed(1)
         process.stdout.write(
