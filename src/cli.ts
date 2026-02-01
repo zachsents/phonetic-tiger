@@ -172,6 +172,7 @@ interface ZipCentroid {
 interface ProcessedStreet {
   stateFips: string
   countyFips: string
+  /** The full street name from TIGER (e.g., "N Main St") */
   fullname: string
   metaphonePrimary: string
   metaphoneSecondary: string | null
@@ -179,8 +180,30 @@ interface ProcessedStreet {
 }
 
 /**
+ * Extracts just the street name from a TIGER fullname for metaphone matching.
+ * Strips common prefixes (N, S, E, W, NE, NW, SE, SW) and suffixes (St, Ave,
+ * Ln, etc.)
+ */
+function extractStreetName(fullname: string): string {
+  // Common direction prefixes
+  const prefixPattern = /^(N|S|E|W|NE|NW|SE|SW|North|South|East|West)\s+/i
+  // Common street type suffixes
+  const suffixPattern =
+    /\s+(St|Ave|Blvd|Dr|Ln|Rd|Ct|Pl|Way|Cir|Trl|Pkwy|Hwy|Loop|Ter|Row|Run|Pass|Path|Pike|Aly|Xing|Sq|N|S|E|W|NE|NW|SE|SW)\.?$/i
+
+  let name = fullname.trim()
+  name = name.replace(prefixPattern, "")
+  name = name.replace(suffixPattern, "")
+  // Sometimes there's a trailing direction after type removal
+  name = name.replace(suffixPattern, "")
+
+  return name.trim() || fullname
+}
+
+/**
  * Reads and processes a DBF file, returning deduplicated streets with metaphone
- * codes.
+ * codes computed on the extracted street name (not full name with
+ * prefix/suffix).
  */
 async function processDbfFile(dbfPath: string): Promise<ProcessedStreet[]> {
   const filename = path.basename(dbfPath)
@@ -224,10 +247,11 @@ async function processDbfFile(dbfPath: string): Promise<ProcessedStreet[]> {
     return []
   }
 
-  // Convert to processed streets with metaphone
+  // Convert to processed streets with metaphone on extracted NAME only
   const results: ProcessedStreet[] = []
   for (const { fullname, zips } of seen.values()) {
-    const [primary, secondary] = doubleMetaphone(fullname)
+    const streetName = extractStreetName(fullname)
+    const [primary, secondary] = doubleMetaphone(streetName)
     results.push({
       stateFips,
       countyFips,
