@@ -131,23 +131,59 @@ async function downloadFiles(
   await Promise.all(tasks)
   console.log(`\nComplete. Downloaded: ${completed}, Errors: ${errors}`)
 
-  // Extract DBF files to separate directories
-  console.log("\nExtracting DBF files...")
+  // Extract DBF files to separate directories (skip if DBF already exists)
+  console.log("\nExtracting DBF files (skipping existing)...")
 
   const addrfeatDir = path.join(outputDir, "addrfeat")
   const featnamesDir = path.join(outputDir, "featnames")
   await fs.mkdir(addrfeatDir, { recursive: true })
   await fs.mkdir(featnamesDir, { recursive: true })
 
-  // Extract ADDRFEAT DBFs
-  await Bun.$`cd ${outputDir} && ls *_addrfeat.zip 2>/dev/null | xargs -P ${concurrency} -I {} unzip -jo {} "*.dbf" -d addrfeat/`
-    .quiet()
-    .nothrow()
+  // Helper to extract only zips whose DBFs don't exist
+  const extractMissing = async (
+    zipPattern: string,
+    dbfDir: string,
+    label: string,
+  ) => {
+    const zipGlob = new Glob(zipPattern)
+    const zipsToExtract: string[] = []
 
-  // Extract FEATNAMES DBFs
-  await Bun.$`cd ${outputDir} && ls *_featnames.zip 2>/dev/null | xargs -P ${concurrency} -I {} unzip -jo {} "*.dbf" -d featnames/`
-    .quiet()
-    .nothrow()
+    for await (const zipFile of zipGlob.scan(outputDir)) {
+      // Convert zip filename to expected DBF filename
+      const dbfName = zipFile.replace(".zip", ".dbf")
+      const dbfPath = path.join(dbfDir, dbfName)
+
+      try {
+        await fs.access(dbfPath)
+        // DBF exists, skip
+      } catch {
+        // DBF doesn't exist, need to extract
+        zipsToExtract.push(path.join(outputDir, zipFile))
+      }
+    }
+
+    if (zipsToExtract.length === 0) {
+      console.log(`  ${label}: all DBFs already extracted`)
+      return
+    }
+
+    console.log(`  ${label}: extracting ${zipsToExtract.length} files...`)
+
+    // Extract in parallel batches
+    const extractLimit = pLimit(concurrency)
+    await Promise.all(
+      zipsToExtract.map((zipPath) =>
+        extractLimit(async () => {
+          await Bun.$`unzip -jo ${zipPath} "*.dbf" -d ${dbfDir}`
+            .quiet()
+            .nothrow()
+        }),
+      ),
+    )
+  }
+
+  await extractMissing("*_addrfeat.zip", addrfeatDir, "ADDRFEAT")
+  await extractMissing("*_featnames.zip", featnamesDir, "FEATNAMES")
 
   const addrfeatCount = await Bun.$`ls ${addrfeatDir}/*.dbf 2>/dev/null | wc -l`
     .quiet()
