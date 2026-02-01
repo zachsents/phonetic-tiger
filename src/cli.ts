@@ -15,6 +15,7 @@ import { program } from "commander"
 import { DBFFile } from "dbffile"
 import { doubleMetaphone } from "double-metaphone"
 import pLimit from "p-limit"
+import { bufferCount, from, lastValueFrom, mergeMap, tap } from "rxjs"
 import * as yauzl from "yauzl-promise"
 import packageJson from "../package.json"
 
@@ -50,11 +51,20 @@ async function generateUrls(output: string) {
 // Download Command
 // ─────────────────────────────────────────────────────────────────────────────
 
+async function checkUnzipInstalled() {
+  const result = await Bun.$`which unzip`.quiet().nothrow()
+  if (result.exitCode !== 0) {
+    throw new Error("unzip is required but not installed. Please install it.")
+  }
+}
+
 async function downloadFiles(
   urlFile: string,
   outputDir: string,
   concurrency: number,
 ) {
+  await checkUnzipInstalled()
+
   const content = await Bun.file(urlFile).text()
   const urls = content.trim().split("\n").filter(Boolean)
 
@@ -96,6 +106,24 @@ async function downloadFiles(
 
   await Promise.all(tasks)
   console.log(`\nComplete. Downloaded: ${completed}, Errors: ${errors}`)
+
+  // Extract DBF files from all zips
+  console.log("\nExtracting DBF files...")
+  const dbfDir = path.join(outputDir, "dbf")
+  await fs.mkdir(dbfDir, { recursive: true })
+
+  const result =
+    await Bun.$`cd ${outputDir} && ls *.zip | xargs -P ${concurrency} -I {} unzip -jo {} "*.dbf" -d dbf/`
+      .quiet()
+      .nothrow()
+  if (result.exitCode !== 0) {
+    console.error("Warning: Some extractions may have failed")
+  }
+
+  const dbfCount = await Bun.$`ls ${dbfDir}/*.dbf 2>/dev/null | wc -l`
+    .quiet()
+    .text()
+  console.log(`Extracted ${dbfCount.trim()} DBF files to ${dbfDir}`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,91 +163,82 @@ async function downloadGazetteer(outputPath: string) {
 // Build Command
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface AddrfeatRecord {
-  fullname: string
-  zipL: string | null
-  zipR: string | null
-  stateFips: string
-  countyFips: string
-}
-
 interface ZipCentroid {
   zip: string
   lat: number
   lon: number
 }
 
-async function extractAddrfeatRecords(
-  zipPath: string,
-  tempDir: string,
-): Promise<AddrfeatRecord[]> {
-  const records: AddrfeatRecord[] = []
-  const filename = path.basename(zipPath)
+interface ProcessedStreet {
+  stateFips: string
+  countyFips: string
+  fullname: string
+  metaphonePrimary: string
+  metaphoneSecondary: string | null
+  zips: string[]
+}
 
-  const fipsMatch = filename.match(/tl_2024_(\d{2})(\d{3})_addrfeat\.zip/)
-  if (!fipsMatch?.[1] || !fipsMatch[2]) return records
+/**
+ * Reads and processes a DBF file, returning deduplicated streets with metaphone
+ * codes.
+ */
+async function processDbfFile(dbfPath: string): Promise<ProcessedStreet[]> {
+  const filename = path.basename(dbfPath)
+
+  const fipsMatch = filename.match(/tl_2024_(\d{2})(\d{3})_addrfeat\.dbf/)
+  if (!fipsMatch?.[1] || !fipsMatch[2]) return []
 
   const stateFips = fipsMatch[1]
   const countyFips = fipsMatch[2]
 
+  // Map for deduplication: key -> { fullname, zips }
+  const seen = new Map<string, { fullname: string; zips: Set<string> }>()
+
   try {
-    const zipBuffer = Buffer.from(await Bun.file(zipPath).arrayBuffer())
-    const zipfile = await yauzl.fromBuffer(zipBuffer)
+    const dbf = await DBFFile.open(dbfPath)
+    let batch: Array<Record<string, unknown>>
 
-    try {
-      let dbfEntry: yauzl.Entry | null = null
-      for await (const entry of zipfile) {
-        if (entry.filename.endsWith(".dbf")) {
-          dbfEntry = entry
-          break
+    while ((batch = await dbf.readRecords(1000)).length > 0) {
+      for (const record of batch) {
+        const fullname = (record.FULLNAME as string | undefined)?.trim()
+        if (!fullname) continue
+
+        const zipL = (record.ZIPL as string | undefined)?.trim() || null
+        const zipR = (record.ZIPR as string | undefined)?.trim() || null
+        if (!zipL && !zipR) continue
+
+        const key = `${stateFips}|${countyFips}|${fullname}`
+        const existing = seen.get(key)
+        if (existing) {
+          if (zipL) existing.zips.add(zipL)
+          if (zipR) existing.zips.add(zipR)
+        } else {
+          const zips = new Set<string>()
+          if (zipL) zips.add(zipL)
+          if (zipR) zips.add(zipR)
+          seen.set(key, { fullname, zips })
         }
       }
-      if (!dbfEntry) return records
-
-      await fs.mkdir(tempDir, { recursive: true })
-      const tempPath = path.join(
-        tempDir,
-        `dbf-${Date.now()}-${Math.random().toString(36).slice(2)}.dbf`,
-      )
-
-      const readStream = await zipfile.openReadStream(dbfEntry)
-      const chunks: Buffer[] = []
-      for await (const chunk of readStream) chunks.push(chunk)
-      await Bun.write(tempPath, Buffer.concat(chunks))
-
-      try {
-        const dbf = await DBFFile.open(tempPath)
-        let batch: Array<Record<string, unknown>>
-
-        while ((batch = await dbf.readRecords(1000)).length > 0) {
-          for (const record of batch) {
-            const fullname = record.FULLNAME as string | undefined
-            if (!fullname) continue
-
-            const zipL = (record.ZIPL as string | undefined)?.trim() || null
-            const zipR = (record.ZIPR as string | undefined)?.trim() || null
-            if (!zipL && !zipR) continue
-
-            records.push({
-              fullname: fullname.trim(),
-              zipL,
-              zipR,
-              stateFips,
-              countyFips,
-            })
-          }
-        }
-      } finally {
-        await fs.unlink(tempPath).catch(() => {})
-      }
-    } finally {
-      await zipfile.close()
     }
   } catch {
-    // Extraction failed
+    return []
   }
 
-  return records
+  // Convert to processed streets with metaphone
+  const results: ProcessedStreet[] = []
+  for (const { fullname, zips } of seen.values()) {
+    const [primary, secondary] = doubleMetaphone(fullname)
+    results.push({
+      stateFips,
+      countyFips,
+      fullname,
+      metaphonePrimary: primary,
+      metaphoneSecondary: secondary ?? null,
+      zips: [...zips],
+    })
+  }
+
+  return results
 }
 
 function parseGazetteer(content: string): ZipCentroid[] {
@@ -247,17 +266,19 @@ async function buildDatabase(
   inputDir: string,
   gazetteerPath: string,
   outputPath: string,
-  concurrency: number,
+  readConcurrency: number,
+  writeBatchSize: number,
 ) {
   const startTime = Date.now()
 
-  // Find all ADDRFEAT zips
-  const glob = new Glob("tl_2024_*_addrfeat.zip")
+  // Find all extracted DBF files
+  const dbfDir = path.join(inputDir, "dbf")
+  const glob = new Glob("tl_2024_*_addrfeat.dbf")
   const files: string[] = []
-  for await (const file of glob.scan(inputDir)) {
-    files.push(path.join(inputDir, file))
+  for await (const file of glob.scan(dbfDir)) {
+    files.push(path.join(dbfDir, file))
   }
-  console.log(`Found ${files.length} ADDRFEAT files`)
+  console.log(`Found ${files.length} DBF files`)
 
   // Create database
   console.log(`Creating database at ${outputPath}...`)
@@ -311,13 +332,7 @@ async function buildDatabase(
   centroidTx()
   console.log(`Inserted ${centroids.length} ZIP centroids`)
 
-  // Process ADDRFEAT files
-  const tempDir = path.join(path.dirname(outputPath), "build-temp")
-  const limit = pLimit(concurrency)
-  let processed = 0
-  let totalStreets = 0
-  let totalZips = 0
-
+  // Prepared statements for batch writes
   const insertStreet = db.prepare(`
     INSERT INTO streets (state_fips, county_fips, fullname, metaphone_primary, metaphone_secondary)
     VALUES (?, ?, ?, ?, ?)
@@ -326,66 +341,63 @@ async function buildDatabase(
     "INSERT INTO street_zips (street_id, zip) VALUES (?, ?)",
   )
 
-  console.log(
-    `Processing ${files.length} files with concurrency ${concurrency}...`,
-  )
+  let filesProcessed = 0
+  let totalStreets = 0
+  let totalZips = 0
 
-  const tasks = files.map((file) =>
-    limit(async () => {
-      const records = await extractAddrfeatRecords(file, tempDir)
-
-      if (records.length > 0) {
-        // Deduplicate within batch
-        const seen = new Map<
-          string,
-          { record: AddrfeatRecord; zips: Set<string> }
-        >()
-        for (const record of records) {
-          const key = `${record.stateFips}|${record.countyFips}|${record.fullname}`
-          const existing = seen.get(key)
-          if (existing) {
-            if (record.zipL) existing.zips.add(record.zipL)
-            if (record.zipR) existing.zips.add(record.zipR)
-          } else {
-            const zips = new Set<string>()
-            if (record.zipL) zips.add(record.zipL)
-            if (record.zipR) zips.add(record.zipR)
-            seen.set(key, { record, zips })
-          }
+  /** Write a batch of streets to the database in a single transaction. */
+  const writeBatch = (batch: ProcessedStreet[]) => {
+    const tx = db.transaction(() => {
+      for (const street of batch) {
+        insertStreet.run(
+          street.stateFips,
+          street.countyFips,
+          street.fullname,
+          street.metaphonePrimary,
+          street.metaphoneSecondary,
+        )
+        const streetId = db.query("SELECT last_insert_rowid() as id").get() as {
+          id: number
         }
-
-        const tx = db.transaction(() => {
-          for (const { record, zips } of seen.values()) {
-            const [primary, secondary] = doubleMetaphone(record.fullname)
-            insertStreet.run(
-              record.stateFips,
-              record.countyFips,
-              record.fullname,
-              primary,
-              secondary ?? null,
-            )
-            const streetId = db
-              .query("SELECT last_insert_rowid() as id")
-              .get() as { id: number }
-            for (const zip of zips) {
-              insertZip.run(streetId.id, zip)
-              totalZips++
-            }
-            totalStreets++
-          }
-        })
-        tx()
+        for (const zip of street.zips) {
+          insertZip.run(streetId.id, zip)
+          totalZips++
+        }
+        totalStreets++
       }
+    })
+    tx()
+  }
 
-      processed++
-      const pct = ((processed / files.length) * 100).toFixed(1)
-      process.stdout.write(
-        `\r[${pct}%] Processed ${path.basename(file)}`.padEnd(60),
-      )
-    }),
+  console.log(
+    `Processing files (read concurrency: ${readConcurrency}, write batch: ${writeBatchSize})...`,
   )
 
-  await Promise.all(tasks)
+  // RxJS pipeline: read DBF files concurrently, flatten streets, batch writes
+  await lastValueFrom(
+    from(files).pipe(
+      // Read and process DBF files with concurrency
+      mergeMap(async (file) => {
+        const streets = await processDbfFile(file)
+        filesProcessed++
+        const pct = ((filesProcessed / files.length) * 100).toFixed(1)
+        process.stdout.write(
+          `\r[${pct}%] Read ${filesProcessed}/${files.length} files, ${totalStreets} streets`.padEnd(
+            70,
+          ),
+        )
+        return streets
+      }, readConcurrency),
+      // Flatten arrays of streets into individual streets
+      mergeMap((streets) => from(streets)),
+      // Buffer into batches for efficient DB writes
+      bufferCount(writeBatchSize),
+      // Write each batch
+      tap((batch) => writeBatch(batch)),
+    ),
+    { defaultValue: undefined },
+  )
+
   console.log("\n")
 
   // Create indexes
@@ -407,9 +419,6 @@ async function buildDatabase(
   db.run("VACUUM")
 
   db.close()
-
-  // Cleanup
-  await fs.rm(tempDir, { recursive: true }).catch(() => {})
 
   const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1)
   console.log(`\nBuild complete in ${elapsed} minutes`)
@@ -463,13 +472,15 @@ program
   )
   .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
   .option("-o, --output <file>", "Output database path", "./addresses.db")
-  .option("-c, --concurrency <n>", "Processing concurrency", "5")
+  .option("-c, --concurrency <n>", "DBF read concurrency", "10")
+  .option("-b, --batch-size <n>", "DB write batch size", "5000")
   .action(async (opts) => {
     await buildDatabase(
       opts.input,
       opts.gazetteer,
       opts.output,
       parseInt(opts.concurrency),
+      parseInt(opts.batchSize),
     )
   })
 
