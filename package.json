@@ -3,11 +3,8 @@
   "version": "1.0.0",
   "description": "Build a phonetic street index from US Census TIGER data for fuzzy address matching",
   "type": "module",
-  "main": "src/cli.ts",
+  "bin": "src/cli.ts",
   "scripts": {
-    "start": "bun run src/cli.ts",
-    "build": "bun build src/cli.ts --compile --bytecode --outfile dist/phonetic-tiger",
-    "build:linux": "bun run build --target=bun-linux-x64",
     "fix": "oxlint --fix-suggestions --type-aware && prettier --write .",
     "check": "bunx tsc --noEmit && bun fix"
   },
