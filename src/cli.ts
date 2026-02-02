@@ -337,14 +337,37 @@ function parseGazetteer(content: string): ZipCentroid[] {
   const centroids: ZipCentroid[] = []
   const lines = content.split("\n")
 
+  const header = lines[0] ?? ""
+  if (!header) throw new Error("Gazetteer file is empty")
+
+  // Split on tab or pipe
+  const sep = /[\t|]/
+  const columns = header.split(sep).map((c) => c.trim())
+
+  // Find required columns by name
+  const zipIdx = columns.indexOf("GEOID")
+  const latIdx = columns.indexOf("INTPTLAT")
+  const lonIdx = columns.indexOf("INTPTLONG")
+
+  if (zipIdx === -1 || latIdx === -1 || lonIdx === -1) {
+    throw new Error(
+      `Gazetteer missing required columns. Found: ${columns.join(", ")}. ` +
+        `Need: GEOID, INTPTLAT, INTPTLONG`,
+    )
+  }
+
+  console.log(
+    `  Detected columns: GEOID@${zipIdx}, INTPTLAT@${latIdx}, INTPTLONG@${lonIdx}`,
+  )
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i]?.trim()
     if (!line) continue
 
-    const parts = line.split("\t")
-    const zip = parts[0]?.trim()
-    const lat = parseFloat(parts[5] ?? "")
-    const lon = parseFloat(parts[6] ?? "")
+    const parts = line.split(sep)
+    const zip = parts[zipIdx]?.trim()
+    const lat = parseFloat(parts[latIdx] ?? "")
+    const lon = parseFloat(parts[lonIdx] ?? "")
 
     if (zip && !isNaN(lat) && !isNaN(lon)) {
       centroids.push({ zip, lat, lon })
@@ -354,31 +377,8 @@ function parseGazetteer(content: string): ZipCentroid[] {
   return centroids
 }
 
-async function buildDatabase(
-  inputDir: string,
-  gazetteerPath: string,
-  outputPath: string,
-  readConcurrency: number,
-  writeBatchSize: number,
-) {
-  const startTime = Date.now()
-
-  // Find all extracted ADDRFEAT DBF files
-  const dbfDir = path.join(inputDir, "dbf")
-  const glob = new Glob("tl_*_addrfeat.dbf")
-  const files: string[] = []
-  for await (const file of glob.scan(dbfDir)) {
-    files.push(path.join(dbfDir, file))
-  }
-  console.log(`Found ${files.length} ADDRFEAT DBF files`)
-
-  // Create database
-  console.log(`Creating database at ${outputPath}...`)
-  await fs.mkdir(path.dirname(outputPath), { recursive: true })
-  for (const suffix of ["", "-wal", "-shm"]) {
-    await fs.unlink(outputPath + suffix).catch(() => {})
-  }
-
+/** Opens (or creates) the database and ensures all tables exist. */
+function openDb(outputPath: string): Database {
   const db = new Database(outputPath)
   db.run("PRAGMA journal_mode = WAL")
   db.run("PRAGMA synchronous = NORMAL")
@@ -411,23 +411,58 @@ async function buildDatabase(
     )
   `)
 
-  // Load gazetteer
+  return db
+}
+
+/** Clears and rebuilds the zip_centroids table from a gazetteer file. */
+async function buildCentroids(db: Database, gazetteerPath: string) {
   console.log("Loading ZIP centroids...")
   const gazContent = await Bun.file(gazetteerPath).text()
   const centroids = parseGazetteer(gazContent)
 
+  // Clear existing
+  db.run("DELETE FROM zip_centroids")
+
   const insertCentroid = db.prepare(
     "INSERT OR REPLACE INTO zip_centroids (zip, lat, lon) VALUES (?, ?, ?)",
   )
-  const centroidTx = db.transaction(() => {
+  const tx = db.transaction(() => {
     for (const { zip, lat, lon } of centroids) {
       insertCentroid.run(zip, lat, lon)
     }
   })
-  centroidTx()
+  tx()
   console.log(`Inserted ${centroids.length} ZIP centroids`)
+  return centroids.length
+}
 
-  // Prepared statements for batch writes
+/** Clears and rebuilds the streets/street_zips tables from ADDRFEAT files. */
+async function buildStreets(
+  db: Database,
+  inputDir: string,
+  readConcurrency: number,
+  writeBatchSize: number,
+) {
+  // Find all extracted ADDRFEAT DBF files
+  const dbfDir = path.join(inputDir, "dbf")
+  const glob = new Glob("tl_*_addrfeat.dbf")
+  const files: string[] = []
+  for await (const file of glob.scan(dbfDir)) {
+    files.push(path.join(dbfDir, file))
+  }
+  console.log(`Found ${files.length} ADDRFEAT DBF files`)
+
+  // Clear existing data
+  console.log("Clearing existing street data...")
+  db.run("DELETE FROM street_zips")
+  db.run("DELETE FROM streets")
+
+  // Drop indexes for faster inserts
+  db.run("DROP INDEX IF EXISTS idx_streets_metaphone_primary")
+  db.run("DROP INDEX IF EXISTS idx_streets_metaphone_secondary")
+  db.run("DROP INDEX IF EXISTS idx_street_zips_zip")
+  db.run("DROP INDEX IF EXISTS idx_street_zips_street_id")
+
   const insertStreet = db.prepare(`
     INSERT INTO streets (state_fips, county_fips, prefix, name, type, suffix, metaphone_primary, metaphone_secondary)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -440,7 +475,6 @@ async function buildDatabase(
   let totalStreets = 0
   let totalZips = 0
 
-  /** Write a batch of streets to the database in a single transaction. */
   const writeBatch = (batch: ProcessedStreet[]) => {
     const tx = db.transaction(() => {
       for (const street of batch) {
@@ -471,10 +505,8 @@ async function buildDatabase(
     `Processing ADDRFEAT files (read concurrency: ${readConcurrency}, write batch: ${writeBatchSize})...`,
   )
 
-  // RxJS pipeline: read ADDRFEAT files, parse with parse-address, batch writes
   await lastValueFrom(
     from(files).pipe(
-      // Read and process ADDRFEAT files with concurrency
       mergeMap(async (file) => {
         const streets = await processAddrfeatFile(file)
         filesProcessed++
@@ -486,11 +518,8 @@ async function buildDatabase(
         )
         return streets
       }, readConcurrency),
-      // Flatten arrays of streets into individual streets
       mergeMap((streets) => from(streets)),
-      // Buffer into batches for efficient DB writes
       bufferCount(writeBatchSize),
-      // Write each batch
       tap((batch) => writeBatch(batch)),
     ),
     { defaultValue: undefined },
@@ -498,7 +527,7 @@ async function buildDatabase(
 
   console.log("\n")
 
-  // Create indexes
+  // Recreate indexes
   console.log("Creating indexes...")
   db.run(
     "CREATE INDEX IF NOT EXISTS idx_streets_metaphone_primary ON streets(metaphone_primary)",
@@ -511,18 +540,7 @@ async function buildDatabase(
     "CREATE INDEX IF NOT EXISTS idx_street_zips_street_id ON street_zips(street_id)",
   )
 
-  // Optimize
-  console.log("Optimizing...")
-  db.run("PRAGMA optimize")
-  db.run("VACUUM")
-
-  db.close()
-
-  const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1)
-  console.log(`\nBuild complete in ${elapsed} minutes`)
-  console.log(`  Streets: ${totalStreets}`)
-  console.log(`  Street-ZIP links: ${totalZips}`)
-  console.log(`  ZIP centroids: ${centroids.length}`)
+  return { totalStreets, totalZips }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -570,26 +588,111 @@ program
     await downloadGazetteer(opts.output, year)
   })
 
-program
+const build = program
   .command("build")
-  .description("Build SQLite database from downloaded files")
+  .description("Build SQLite database (run without subcommand for full build)")
+  .option("-o, --output <file>", "Output database path", "./addresses.db")
+
+build
+  .command("centroids")
+  .description("Rebuild only ZIP centroids from gazetteer")
+  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
+  .action(async (opts, cmd) => {
+    const parentOpts = cmd.parent?.opts() ?? {}
+    const outputPath = parentOpts.output ?? "./addresses.db"
+
+    const startTime = Date.now()
+    console.log(`Opening database at ${outputPath}...`)
+    await fs.mkdir(path.dirname(outputPath), { recursive: true })
+    const db = openDb(outputPath)
+
+    const count = await buildCentroids(db, opts.gazetteer)
+
+    db.run("PRAGMA optimize")
+    db.close()
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
+    console.log(`\nCentroids build complete in ${elapsed}s`)
+    console.log(`  ZIP centroids: ${count}`)
+  })
+
+build
+  .command("streets")
+  .description("Rebuild only streets from ADDRFEAT files")
   .option(
     "-i, --input <dir>",
     "Directory containing ADDRFEAT zips",
     "./addrfeat",
   )
-  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
-  .option("-o, --output <file>", "Output database path", "./addresses.db")
   .option("-c, --concurrency <n>", "DBF read concurrency", "10")
   .option("-b, --batch-size <n>", "DB write batch size", "5000")
-  .action(async (opts) => {
-    await buildDatabase(
+  .action(async (opts, cmd) => {
+    const parentOpts = cmd.parent?.opts() ?? {}
+    const outputPath = parentOpts.output ?? "./addresses.db"
+
+    const startTime = Date.now()
+    console.log(`Opening database at ${outputPath}...`)
+    await fs.mkdir(path.dirname(outputPath), { recursive: true })
+    const db = openDb(outputPath)
+
+    const { totalStreets, totalZips } = await buildStreets(
+      db,
       opts.input,
-      opts.gazetteer,
-      opts.output,
       parseInt(opts.concurrency),
       parseInt(opts.batchSize),
     )
+
+    console.log("Optimizing...")
+    db.run("PRAGMA optimize")
+    db.run("VACUUM")
+    db.close()
+
+    const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1)
+    console.log(`\nStreets build complete in ${elapsed} minutes`)
+    console.log(`  Streets: ${totalStreets}`)
+    console.log(`  Street-ZIP links: ${totalZips}`)
+  })
+
+// Default action when no subcommand - full build
+build
+  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
+  .option(
+    "-i, --input <dir>",
+    "Directory containing ADDRFEAT zips",
+    "./addrfeat",
+  )
+  .option("-c, --concurrency <n>", "DBF read concurrency", "10")
+  .option("-b, --batch-size <n>", "DB write batch size", "5000")
+  .action(async (opts) => {
+    const startTime = Date.now()
+
+    // Delete existing DB files for clean rebuild
+    console.log(`Creating fresh database at ${opts.output}...`)
+    await fs.mkdir(path.dirname(opts.output), { recursive: true })
+    for (const suffix of ["", "-wal", "-shm"]) {
+      await fs.unlink(opts.output + suffix).catch(() => {})
+    }
+
+    const db = openDb(opts.output)
+
+    const centroidCount = await buildCentroids(db, opts.gazetteer)
+    const { totalStreets, totalZips } = await buildStreets(
+      db,
+      opts.input,
+      parseInt(opts.concurrency),
+      parseInt(opts.batchSize),
+    )
+
+    console.log("Optimizing...")
+    db.run("PRAGMA optimize")
+    db.run("VACUUM")
+    db.close()
+
+    const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1)
+    console.log(`\nFull build complete in ${elapsed} minutes`)
+    console.log(`  Streets: ${totalStreets}`)
+    console.log(`  Street-ZIP links: ${totalZips}`)
+    console.log(`  ZIP centroids: ${centroidCount}`)
   })
 
 program.parse()
