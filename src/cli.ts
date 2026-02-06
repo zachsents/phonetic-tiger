@@ -392,7 +392,6 @@ function openDb(outputPath: string): Database {
       FOREIGN KEY (street_id) REFERENCES streets(id)
     )
   `)
-  // New zips table with city/state (replaces old zip_centroids)
   db.run(`
     CREATE TABLE IF NOT EXISTS zips (
       zip TEXT PRIMARY KEY,
@@ -400,14 +399,6 @@ function openDb(outputPath: string): Database {
       state TEXT NOT NULL,
       lat REAL,
       lon REAL
-    )
-  `)
-  // Keep old table for backward compatibility during migration
-  db.run(`
-    CREATE TABLE IF NOT EXISTS zip_centroids (
-      zip TEXT PRIMARY KEY,
-      lat REAL NOT NULL,
-      lon REAL NOT NULL
     )
   `)
 
@@ -450,22 +441,15 @@ async function buildZips(db: Database, geonamesPath: string) {
   const content = await Bun.file(geonamesPath).text()
   const zips = parseGeoNamesZips(content)
 
-  // Clear existing
   db.run("DELETE FROM zips")
-  db.run("DELETE FROM zip_centroids")
 
   const insertZip = db.prepare(
     "INSERT OR REPLACE INTO zips (zip, city, state, lat, lon) VALUES (?, ?, ?, ?, ?)",
-  )
-  // Also populate old table for backward compatibility
-  const insertCentroid = db.prepare(
-    "INSERT OR REPLACE INTO zip_centroids (zip, lat, lon) VALUES (?, ?, ?)",
   )
 
   const tx = db.transaction(() => {
     for (const { zip, city, state, lat, lon } of zips) {
       insertZip.run(zip, city, state, lat, lon)
-      insertCentroid.run(zip, lat, lon)
     }
   })
   tx()
