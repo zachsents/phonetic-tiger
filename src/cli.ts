@@ -31,6 +31,9 @@ function getGazetteerUrl(year: number) {
   return `https://www2.census.gov/geo/docs/maps-data/data/gazetteer/${year}_Gazetteer/${year}_Gaz_zcta_national.zip`
 }
 
+/** GeoNames US ZIP code data URL (includes city, state, coordinates). */
+const GEONAMES_ZIP_URL = "https://download.geonames.org/export/zip/US.zip"
+
 /**
  * Auto-resolves the latest available TIGER year by checking URLs starting from
  * the current year and working backwards.
@@ -227,8 +230,10 @@ async function downloadGazetteer(outputPath: string, year: number) {
 // Build Command
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface ZipCentroid {
+interface ZipInfo {
   zip: string
+  city: string
+  state: string
   lat: number
   lon: number
 }
@@ -333,48 +338,32 @@ async function processAddrfeatFile(
   return results
 }
 
-function parseGazetteer(content: string): ZipCentroid[] {
-  const centroids: ZipCentroid[] = []
+/**
+ * Parses GeoNames US.txt format (tab-separated). Format: country, zip, city,
+ * state_name, state_abbrev, ..., lat, lon, accuracy
+ */
+function parseGeoNamesZips(content: string): ZipInfo[] {
+  const zips: ZipInfo[] = []
   const lines = content.split("\n")
 
-  const header = lines[0] ?? ""
-  if (!header) throw new Error("Gazetteer file is empty")
+  for (const line of lines) {
+    if (!line.trim()) continue
 
-  // Split on tab or pipe
-  const sep = /[\t|]/
-  const columns = header.split(sep).map((c) => c.trim())
+    const parts = line.split("\t")
+    // GeoNames columns: 0=country, 1=zip, 2=city, 3=state_name, 4=state_abbrev,
+    // 5-8=admin2/3, 9=lat, 10=lon, 11=accuracy
+    const zip = parts[1]?.trim()
+    const city = parts[2]?.trim()
+    const state = parts[4]?.trim() // 2-letter abbreviation
+    const lat = parseFloat(parts[9] ?? "")
+    const lon = parseFloat(parts[10] ?? "")
 
-  // Find required columns by name
-  const zipIdx = columns.indexOf("GEOID")
-  const latIdx = columns.indexOf("INTPTLAT")
-  const lonIdx = columns.indexOf("INTPTLONG")
-
-  if (zipIdx === -1 || latIdx === -1 || lonIdx === -1) {
-    throw new Error(
-      `Gazetteer missing required columns. Found: ${columns.join(", ")}. ` +
-        `Need: GEOID, INTPTLAT, INTPTLONG`,
-    )
-  }
-
-  console.log(
-    `  Detected columns: GEOID@${zipIdx}, INTPTLAT@${latIdx}, INTPTLONG@${lonIdx}`,
-  )
-
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i]?.trim()
-    if (!line) continue
-
-    const parts = line.split(sep)
-    const zip = parts[zipIdx]?.trim()
-    const lat = parseFloat(parts[latIdx] ?? "")
-    const lon = parseFloat(parts[lonIdx] ?? "")
-
-    if (zip && !isNaN(lat) && !isNaN(lon)) {
-      centroids.push({ zip, lat, lon })
+    if (zip && city && state && !isNaN(lat) && !isNaN(lon)) {
+      zips.push({ zip, city, state, lat, lon })
     }
   }
 
-  return centroids
+  return zips
 }
 
 /** Opens (or creates) the database and ensures all tables exist. */
@@ -403,6 +392,17 @@ function openDb(outputPath: string): Database {
       FOREIGN KEY (street_id) REFERENCES streets(id)
     )
   `)
+  // New zips table with city/state (replaces old zip_centroids)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS zips (
+      zip TEXT PRIMARY KEY,
+      city TEXT NOT NULL,
+      state TEXT NOT NULL,
+      lat REAL,
+      lon REAL
+    )
+  `)
+  // Keep old table for backward compatibility during migration
   db.run(`
     CREATE TABLE IF NOT EXISTS zip_centroids (
       zip TEXT PRIMARY KEY,
@@ -414,26 +414,63 @@ function openDb(outputPath: string): Database {
   return db
 }
 
-/** Clears and rebuilds the zip_centroids table from a gazetteer file. */
-async function buildCentroids(db: Database, gazetteerPath: string) {
-  console.log("Loading ZIP centroids...")
-  const gazContent = await Bun.file(gazetteerPath).text()
-  const centroids = parseGazetteer(gazContent)
+/** Downloads and extracts GeoNames US ZIP code data. */
+async function downloadGeoNamesZips(outputPath: string) {
+  console.log("Downloading GeoNames US ZIP data...")
+
+  const response = await fetch(GEONAMES_ZIP_URL)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+  const zipBuffer = Buffer.from(await response.arrayBuffer())
+  const zipfile = await yauzl.fromBuffer(zipBuffer)
+
+  try {
+    for await (const entry of zipfile) {
+      if (entry.filename === "US.txt") {
+        const readStream = await zipfile.openReadStream(entry)
+        const chunks: Buffer[] = []
+        for await (const chunk of readStream) chunks.push(chunk)
+
+        await fs.mkdir(path.dirname(outputPath), { recursive: true })
+        await Bun.write(outputPath, Buffer.concat(chunks))
+        console.log(`Extracted to ${outputPath}`)
+        return
+      }
+    }
+  } finally {
+    await zipfile.close()
+  }
+
+  throw new Error("No US.txt file found in GeoNames zip")
+}
+
+/** Clears and rebuilds the zips table from GeoNames data. */
+async function buildZips(db: Database, geonamesPath: string) {
+  console.log("Loading ZIP codes with city/state...")
+  const content = await Bun.file(geonamesPath).text()
+  const zips = parseGeoNamesZips(content)
 
   // Clear existing
+  db.run("DELETE FROM zips")
   db.run("DELETE FROM zip_centroids")
 
+  const insertZip = db.prepare(
+    "INSERT OR REPLACE INTO zips (zip, city, state, lat, lon) VALUES (?, ?, ?, ?, ?)",
+  )
+  // Also populate old table for backward compatibility
   const insertCentroid = db.prepare(
     "INSERT OR REPLACE INTO zip_centroids (zip, lat, lon) VALUES (?, ?, ?)",
   )
+
   const tx = db.transaction(() => {
-    for (const { zip, lat, lon } of centroids) {
+    for (const { zip, city, state, lat, lon } of zips) {
+      insertZip.run(zip, city, state, lat, lon)
       insertCentroid.run(zip, lat, lon)
     }
   })
   tx()
-  console.log(`Inserted ${centroids.length} ZIP centroids`)
-  return centroids.length
+  console.log(`Inserted ${zips.length} ZIP codes with city/state`)
+  return zips.length
 }
 
 /** Clears and rebuilds the streets/street_zips tables from ADDRFEAT files. */
@@ -579,13 +616,24 @@ program
 
 program
   .command("gazetteer")
-  .description("Download ZCTA gazetteer for ZIP centroids")
+  .description("[DEPRECATED] Download ZCTA gazetteer (use 'geonames' instead)")
   .option("-o, --output <file>", "Output file", "./gazetteer.txt")
   .option("-y, --year <year>", "Gazetteer year (or 'auto' to resolve)", "auto")
   .action(async (opts) => {
+    console.warn(
+      "Warning: 'gazetteer' is deprecated. Use 'geonames' command for city/state data.",
+    )
     const year =
       opts.year === "auto" ? await resolveYear() : parseInt(opts.year)
     await downloadGazetteer(opts.output, year)
+  })
+
+program
+  .command("geonames")
+  .description("Download GeoNames US ZIP data (includes city, state, coords)")
+  .option("-o, --output <file>", "Output file", "./geonames-us.txt")
+  .action(async (opts) => {
+    await downloadGeoNamesZips(opts.output)
   })
 
 const build = program
@@ -594,9 +642,9 @@ const build = program
   .option("-o, --output <file>", "Output database path", "./addresses.db")
 
 build
-  .command("centroids")
-  .description("Rebuild only ZIP centroids from gazetteer")
-  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
+  .command("zips")
+  .description("Rebuild only ZIP codes from GeoNames data")
+  .option("-g, --geonames <file>", "GeoNames file path", "./geonames-us.txt")
   .action(async (opts, cmd) => {
     const parentOpts = cmd.parent?.opts() ?? {}
     const outputPath = parentOpts.output ?? "./addresses.db"
@@ -606,14 +654,14 @@ build
     await fs.mkdir(path.dirname(outputPath), { recursive: true })
     const db = openDb(outputPath)
 
-    const count = await buildCentroids(db, opts.gazetteer)
+    const count = await buildZips(db, opts.geonames)
 
     db.run("PRAGMA optimize")
     db.close()
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
-    console.log(`\nCentroids build complete in ${elapsed}s`)
-    console.log(`  ZIP centroids: ${count}`)
+    console.log(`\nZIPs build complete in ${elapsed}s`)
+    console.log(`  ZIP codes: ${count}`)
   })
 
 build
@@ -655,7 +703,7 @@ build
 
 // Default action when no subcommand - full build
 build
-  .option("-g, --gazetteer <file>", "Gazetteer file path", "./gazetteer.txt")
+  .option("-g, --geonames <file>", "GeoNames file path", "./geonames-us.txt")
   .option(
     "-i, --input <dir>",
     "Directory containing ADDRFEAT zips",
@@ -675,7 +723,7 @@ build
 
     const db = openDb(opts.output)
 
-    const centroidCount = await buildCentroids(db, opts.gazetteer)
+    const zipCount = await buildZips(db, opts.geonames)
     const { totalStreets, totalZips } = await buildStreets(
       db,
       opts.input,
@@ -692,7 +740,7 @@ build
     console.log(`\nFull build complete in ${elapsed} minutes`)
     console.log(`  Streets: ${totalStreets}`)
     console.log(`  Street-ZIP links: ${totalZips}`)
-    console.log(`  ZIP centroids: ${centroidCount}`)
+    console.log(`  ZIP codes: ${zipCount}`)
   })
 
 program.parse()
