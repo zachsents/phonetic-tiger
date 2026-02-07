@@ -394,7 +394,7 @@ function openDb(outputPath: string): Database {
   `)
   db.run(`
     CREATE TABLE IF NOT EXISTS zips (
-      zip TEXT PRIMARY KEY,
+      zip TEXT PRIMARY KEY NOT NULL,
       city TEXT NOT NULL,
       state TEXT NOT NULL,
       lat REAL NOT NULL,
