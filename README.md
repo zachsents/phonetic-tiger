@@ -31,8 +31,8 @@ CREATE TABLE zips (
   zip TEXT PRIMARY KEY,
   city TEXT NOT NULL,
   state TEXT NOT NULL,  -- 2-letter abbreviation
-  lat REAL,
-  lon REAL
+  lat REAL NOT NULL,
+  lon REAL NOT NULL
 );
 ```
 

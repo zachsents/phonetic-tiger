@@ -397,8 +397,8 @@ function openDb(outputPath: string): Database {
       zip TEXT PRIMARY KEY,
       city TEXT NOT NULL,
       state TEXT NOT NULL,
-      lat REAL,
-      lon REAL
+      lat REAL NOT NULL,
+      lon REAL NOT NULL
     )
   `)
 
