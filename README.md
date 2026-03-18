@@ -49,3 +49,7 @@ bun run start -- --help
 bun run build          # macOS
 bun run build:linux    # Linux
 ```
+
+## Data sources
+
+ZIP code data (city, state, coordinates) is from [GeoNames](https://www.geonames.org/), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).
